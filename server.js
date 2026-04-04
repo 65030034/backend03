@@ -94,10 +94,8 @@ app.get('/api/folders', async (req, res) => {
     if (myCache.has(cacheKey)) return res.json(myCache.get(cacheKey));
 
     try {
-        // ใช้ Connection ที่เปิดค้างไว้
         const client = await getImapClient(user, pass);
         let folders = await client.list();
-        // ❌ ไม่ต้อง logout ทิ้งแล้ว! ปล่อยค้างไว้รอคำสั่งต่อไปเลย
         
         const responseData = { success: true, data: folders.map(f => ({ name: f.name, path: f.path })) };
         myCache.set(cacheKey, responseData);
@@ -115,13 +113,15 @@ app.get('/api/emails', async (req, res) => {
 
     try {
         const client = await getImapClient(user, pass);
-        let lock = await client.getMailboxLock(folderPath); // ล็อคโฟลเดอร์เพื่ออ่าน
+        let lock = await client.getMailboxLock(folderPath); 
         try {
             const mailbox = client.mailbox;
             if (mailbox.exists === 0) return res.json({ success: true, data: [] });
 
             let emails = [];
-            let start = Math.max(1, mailbox.exists - 14); 
+            // 🚀 อัปเกรดความเร็ว: ดึงแค่ 5 ฉบับล่าสุด (ลดจาก 14 เหลือ 4)
+            let start = Math.max(1, mailbox.exists - 4); 
+            
             for await (let msg of client.fetch(`${start}:*`, { envelope: true })) {
                 emails.push({
                     uid: msg.uid,
@@ -135,8 +135,7 @@ app.get('/api/emails', async (req, res) => {
             myCache.set(cacheKey, responseData);
             res.json(responseData);
         } finally { 
-            lock.release(); // คืนกุญแจล็อคโฟลเดอร์
-            // ❌ ไม่ต้อง logout!
+            lock.release(); 
         }
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -165,7 +164,6 @@ app.get('/api/email-content', async (req, res) => {
             res.json(responseData);
         } finally { 
             lock.release(); 
-            // ❌ ไม่ต้อง logout!
         }
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -173,5 +171,5 @@ app.get('/api/email-content', async (req, res) => {
 const PORT = process.env.PORT || 5001;
 app.listen(PORT, () => {
     console.log(`🦄 UniPony Backend ready on port ${PORT}`);
-    console.log(`🚀 Caching & Connection Pooling activated!`);
+    console.log(`🚀 Caching & Connection Pooling activated! (Fetching strictly 5 latest emails)`);
 });
