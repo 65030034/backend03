@@ -2,12 +2,13 @@ const express = require('express');
 const cors = require('cors');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
-const NodeCache = require("node-cache"); 
 
 const app = express();
-const myCache = new NodeCache({ stdTTL: 120 }); 
-const IMAP_HOST = 'imap.smtp.dev'; // 📌 โฮสต์ของเว็บที่ 1 (smtp.dev)
+const IMAP_HOST = 'imap.smtp.dev'; // 📌 โฮสต์ที่พิสูจน์แล้วว่าล็อกอินผ่าน
 
+// ==========================================
+// ⚙️ ตั้งค่า CORS ให้รองรับ Netlify และ Localhost
+// ==========================================
 app.use(cors({
     origin: [
         'http://localhost:5173', 
@@ -21,161 +22,154 @@ app.use(cors({
 
 app.use(express.json());
 
-const activeClients = new Map();
-
-function resetIdleTimer(user, client) {
-    if (client.idleTimer) clearTimeout(client.idleTimer);
-    
-    client.idleTimer = setTimeout(async () => {
-        try { await client.logout(); } catch (e) {}
-        activeClients.delete(user);
-    }, 5 * 60 * 1000);
-}
-
-async function getImapClient(user, pass) {
-    if (!user || !pass) throw new Error('Missing Credentials');
-
-    if (activeClients.has(user)) {
-        const existingClient = activeClients.get(user);
-        if (existingClient.usable) {
-            resetIdleTimer(user, existingClient); 
-            return existingClient;
-        } else {
-            activeClients.delete(user); 
-        }
-    }
-
-    const client = new ImapFlow({ 
-        host: IMAP_HOST, 
-        port: 993, 
-        secure: true, 
-        auth: { user, pass }, 
-        logger: false, 
-        connectionTimeout: 15000 
-    });
-
-    await client.connect();
-    activeClients.set(user, client);
-    resetIdleTimer(user, client);
-
-    client.on('close', () => activeClients.delete(user));
-    client.on('error', () => activeClients.delete(user));
-
-    return client;
-}
-
-// ----------------------------------------------------
-// ROUTES
-// ----------------------------------------------------
-
+// ==========================================
+// 🔑 1. Route: Login (วอร์มเครื่อง)
+// ==========================================
 app.post('/api/login', async (req, res) => {
     const { email, password } = req.body;
+    const client = new ImapFlow({
+        host: IMAP_HOST,
+        port: 993,
+        secure: true,
+        auth: { user: email, pass: password },
+        logger: false,
+        connectionTimeout: 15000
+    });
+
     try {
-        await getImapClient(email, password);
+        await client.connect();
+        await client.logout();
         res.json({ success: true });
-    } catch (err) { 
-        res.status(401).json({ success: false, error: err.message }); 
+    } catch (err) {
+        res.status(401).json({ success: false, error: err.message });
     }
 });
 
+// ==========================================
+// 📂 2. Route: Folders (ดึงรายชื่อห้อง)
+// ==========================================
 app.get('/api/folders', async (req, res) => {
     const user = req.headers['x-imap-user'];
     const pass = req.headers['x-imap-pass'];
-    const cacheKey = `folders_${user}`; 
 
-    if (myCache.has(cacheKey)) return res.json(myCache.get(cacheKey));
+    const client = new ImapFlow({
+        host: IMAP_HOST,
+        port: 993,
+        secure: true,
+        auth: { user, pass },
+        logger: false
+    });
 
     try {
-        const client = await getImapClient(user, pass);
+        await client.connect();
         let folders = await client.list();
-        
-        const responseData = { success: true, data: folders.map(f => ({ name: f.name, path: f.path })) };
-        myCache.set(cacheKey, responseData);
-        res.json(responseData);
-    } catch (err) { res.status(500).json({ error: err.message }); }
+        res.json({ success: true, data: folders.map(f => ({ name: f.name, path: f.path })) });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    } finally {
+        await client.logout();
+    }
 });
 
+// ==========================================
+// 📩 3. Route: Emails (โหมดสไนเปอร์ ดึงทีละฉบับ!)
+// ==========================================
 app.get('/api/emails', async (req, res) => {
     const user = req.headers['x-imap-user'];
     const pass = req.headers['x-imap-pass'];
     const folderPath = req.query.folder || 'INBOX';
-    const cacheKey = `emails_${user}_${folderPath}`; 
 
-    if (myCache.has(cacheKey)) return res.json(myCache.get(cacheKey));
+    const client = new ImapFlow({
+        host: IMAP_HOST,
+        port: 993,
+        secure: true,
+        auth: { user, pass },
+        logger: false
+    });
 
     try {
-        const freshClient = new ImapFlow({ 
-            host: IMAP_HOST, 
-            port: 993, 
-            secure: true, 
-            auth: { user, pass }, 
-            logger: false, 
-            connectionTimeout: 15000 
-        });
-
-        await freshClient.connect();
-        let lock = await freshClient.getMailboxLock(folderPath); 
+        await client.connect();
+        let lock = await client.getMailboxLock(folderPath);
         try {
-            // 🚨 อัปเกรด: ค้นหาโดยบังคับขอ UID ตรงๆ เพื่อไม่ให้เซิร์ฟเวอร์คาย Sequence Number มาให้
-            let searchResult = await freshClient.search({ all: true }, { uid: true }); 
-
-            if (!searchResult || searchResult.length === 0) {
-                return res.json({ success: true, data: [] });
-            }
+            const total = client.mailbox.exists;
+            if (total === 0) return res.json({ success: true, data: [] });
 
             let emails = [];
-            // ดึง 15 ฉบับล่าสุดมาแสดง
-            let latestUids = searchResult.slice(-15); 
-            
-            for await (let msg of freshClient.fetch(latestUids, { envelope: true, uid: true })) {
-                emails.push({
-                    uid: msg.uid,
-                    subject: msg.envelope.subject || '(No Subject)',
-                    from: msg.envelope.from?.[0]?.address || 'Unknown',
-                    date: msg.envelope.date
-                });
+            // ดึงสูงสุด 15 ฉบับล่าสุด
+            let start = Math.max(1, total - 14);
+
+            // 🎯 ท่าไม้ตาย V10: วนลูปดึงทีละฉบับ (ป้องกัน Server สำลักเมลคนนอก)
+            for (let i = total; i >= start; i--) {
+                try {
+                    // ใช้ fetchOne ดึงแถวตรงๆ (Sequence) ไม่ใช้ UID ที่รวนๆ
+                    let msg = await client.fetchOne(i.toString(), { envelope: true }, { uid: false });
+                    
+                    if (msg && msg.envelope) {
+                        emails.push({
+                            uid: i, // ใช้เลขแถวแทน UID ไปเลย ชัวร์กว่า
+                            subject: msg.envelope.subject || '(No Subject)',
+                            from: msg.envelope.from?.[0]?.address || 'Unknown',
+                            date: msg.envelope.date
+                        });
+                    }
+                } catch (fetchErr) {
+                    console.error(`❌ ข้ามฉบับที่ ${i}:`, fetchErr.message);
+                }
             }
-            
-            const responseData = { success: true, data: emails.reverse() };
-            myCache.set(cacheKey, responseData, 5); 
-            res.json(responseData);
-        } finally { 
-            lock.release(); 
-            await freshClient.logout(); 
+            res.json({ success: true, data: emails });
+        } finally {
+            lock.release();
         }
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    } finally {
+        await client.logout();
+    }
 });
 
+// ==========================================
+// 📄 4. Route: Content (ดึงเนื้อหาเมล)
+// ==========================================
 app.get('/api/email-content', async (req, res) => {
     const user = req.headers['x-imap-user'];
     const pass = req.headers['x-imap-pass'];
-    const { folder, uid } = req.query;
-    const cacheKey = `content_${user}_${folder}_${uid}`; 
+    const { folder, uid } = req.query; // uid ในที่นี้คือเลขแถว (Sequence)
 
-    if (myCache.has(cacheKey)) return res.json(myCache.get(cacheKey));
+    const client = new ImapFlow({
+        host: IMAP_HOST,
+        port: 993,
+        secure: true,
+        auth: { user, pass },
+        logger: false
+    });
 
     try {
-        const client = await getImapClient(user, pass);
+        await client.connect();
         let lock = await client.getMailboxLock(folder || 'INBOX');
         try {
-            let message = await client.fetchOne(uid, { source: true, uid: true });
+            // ดึง Source ดิบมา parse เอง ป้องกันเซิร์ฟเวอร์เอ๋อ
+            let message = await client.fetchOne(uid, { source: true }, { uid: false });
             const parsed = await simpleParser(message.source);
             
-            const responseData = { 
+            res.json({ 
                 success: true, 
                 content: parsed.html || parsed.textAsHtml || parsed.text || "No Content" 
-            };
-
-            myCache.set(cacheKey, responseData);
-            res.json(responseData);
-        } finally { 
-            lock.release(); 
+            });
+        } finally {
+            lock.release();
         }
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    } finally {
+        await client.logout();
+    }
 });
 
+// ==========================================
+// 🚀 Start Server
+// ==========================================
 const PORT = process.env.PORT || 5001;
 app.listen(PORT, () => {
-    console.log(`🦄 UniPony Backend ready on port ${PORT}`);
-    console.log(`🚀 Fresh Connection Mode Activated! UID Mapping Fixed!`);
+    console.log(`🦄 UniPony Sniper-Backend ready on port ${PORT}`);
+    console.log(`✅ Mode: Sequence Fetching (Anti-Server-Lag)`);
 });
