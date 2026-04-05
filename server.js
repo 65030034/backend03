@@ -5,8 +5,8 @@ const { simpleParser } = require('mailparser');
 const NodeCache = require("node-cache"); 
 
 const app = express();
-const myCache = new NodeCache({ stdTTL: 120 }); // ความจำเสื่อมใน 2 นาที
-const IMAP_HOST = 'imap.smtp.dev';
+const myCache = new NodeCache({ stdTTL: 120 }); // ความจำเสื่อมใน 2 นาที (สำหรับโฟลเดอร์และเนื้อหาเมล)
+const IMAP_HOST = 'imap.smtp.dev'; // 📌 โฮสต์ของเว็บที่ 1
 
 app.use(cors({
     origin: [
@@ -43,10 +43,10 @@ async function getImapClient(user, pass) {
     if (activeClients.has(user)) {
         const existingClient = activeClients.get(user);
         if (existingClient.usable) {
-            resetIdleTimer(user, existingClient); // รีเซ็ตเวลา
+            resetIdleTimer(user, existingClient); 
             return existingClient;
         } else {
-            activeClients.delete(user); // ถ้าสายพัง ให้ลบทิ้ง
+            activeClients.delete(user); 
         }
     }
 
@@ -64,7 +64,6 @@ async function getImapClient(user, pass) {
     activeClients.set(user, client);
     resetIdleTimer(user, client);
 
-    // เคลียร์ทิ้งถ้าสายหลุดหรือพังจากเซิร์ฟเวอร์
     client.on('close', () => activeClients.delete(user));
     client.on('error', () => activeClients.delete(user));
 
@@ -78,7 +77,6 @@ async function getImapClient(user, pass) {
 app.post('/api/login', async (req, res) => {
     const { email, password } = req.body;
     try {
-        // ให้ต่อ IMAP แล้วเก็บค้างไว้เลย พอกดเข้าหน้าปุ๊บจะได้ดึงข้อมูลไวๆ
         await getImapClient(email, password);
         res.json({ success: true });
     } catch (err) { 
@@ -103,26 +101,38 @@ app.get('/api/folders', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// 🚨🚨 อัปเกรดความชัวร์: ปิด Pooling ทิ้งสายเก่า ต่อสายใหม่ทุกครั้งที่เช็คเมล! 🚨🚨
 app.get('/api/emails', async (req, res) => {
     const user = req.headers['x-imap-user'];
     const pass = req.headers['x-imap-pass'];
     const folderPath = req.query.folder || 'INBOX';
     const cacheKey = `emails_${user}_${folderPath}`; 
 
+    // ✅ ถ้ามีข้อมูลใน 5 วินาทีที่แล้ว ให้ตอบกลับทันที (กันลูกค้ารีเฟรชรัวๆ จนแอปพัง)
     if (myCache.has(cacheKey)) return res.json(myCache.get(cacheKey));
 
     try {
-        const client = await getImapClient(user, pass);
-        let lock = await client.getMailboxLock(folderPath); 
+        // 🛠️ สร้าง Connection ใหม่สดๆ เพื่อบังคับให้เซิร์ฟเวอร์นับเมลใหม่
+        const freshClient = new ImapFlow({ 
+            host: IMAP_HOST, 
+            port: 993, 
+            secure: true, 
+            auth: { user, pass }, 
+            logger: false, 
+            connectionTimeout: 15000 
+        });
+
+        await freshClient.connect();
+        let lock = await freshClient.getMailboxLock(folderPath); 
         try {
-            const mailbox = client.mailbox;
+            const mailbox = freshClient.mailbox;
             if (mailbox.exists === 0) return res.json({ success: true, data: [] });
 
             let emails = [];
-            // 🚀 อัปเกรดความเร็ว: ดึงแค่ 5 ฉบับล่าสุด (ลดจาก 14 เหลือ 4)
+            // ดึง 5 ฉบับล่าสุด
             let start = Math.max(1, mailbox.exists - 4); 
             
-            for await (let msg of client.fetch(`${start}:*`, { envelope: true })) {
+            for await (let msg of freshClient.fetch(`${start}:*`, { envelope: true })) {
                 emails.push({
                     uid: msg.uid,
                     subject: msg.envelope.subject || '(No Subject)',
@@ -132,10 +142,13 @@ app.get('/api/emails', async (req, res) => {
             }
             
             const responseData = { success: true, data: emails.reverse() };
-            myCache.set(cacheKey, responseData);
+            // ✅ ตั้ง Cache ไว้แค่ 5 วินาที! 
+            myCache.set(cacheKey, responseData, 5); 
             res.json(responseData);
         } finally { 
             lock.release(); 
+            // 🛠️ ทิ้งสายเลย ไม่ต้องเก็บไว้ใน activeClients
+            await freshClient.logout(); 
         }
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -149,6 +162,7 @@ app.get('/api/email-content', async (req, res) => {
     if (myCache.has(cacheKey)) return res.json(myCache.get(cacheKey));
 
     try {
+        // ดึงเนื้อหาเมล ใช้สายเก่าที่ค้างไว้ได้เลยเพราะเร็วกว่า
         const client = await getImapClient(user, pass);
         let lock = await client.getMailboxLock(folder || 'INBOX');
         try {
@@ -171,5 +185,5 @@ app.get('/api/email-content', async (req, res) => {
 const PORT = process.env.PORT || 5001;
 app.listen(PORT, () => {
     console.log(`🦄 UniPony Backend ready on port ${PORT}`);
-    console.log(`🚀 Caching & Connection Pooling activated! (Fetching strictly 5 latest emails)`);
+    console.log(`🚀 Caching activated! Bypass Pooling for /api/emails to fix stale mailbox.`);
 });
