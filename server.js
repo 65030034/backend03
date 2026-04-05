@@ -116,16 +116,17 @@ app.get('/api/emails', async (req, res) => {
         await freshClient.connect();
         let lock = await freshClient.getMailboxLock(folderPath); 
         try {
-            let uids = await freshClient.search({ all: true }); 
+            // 🚨 อัปเกรด: ค้นหาโดยบังคับขอ UID ตรงๆ เพื่อไม่ให้เซิร์ฟเวอร์คาย Sequence Number มาให้
+            let searchResult = await freshClient.search({ all: true }, { uid: true }); 
 
-            if (!uids || uids.length === 0) {
+            if (!searchResult || searchResult.length === 0) {
                 return res.json({ success: true, data: [] });
             }
 
             let emails = [];
-            let latestUids = uids.slice(-5); 
+            // ดึง 15 ฉบับล่าสุดมาแสดง
+            let latestUids = searchResult.slice(-15); 
             
-            // 🚨 อุดรอยรั่ว: เพิ่ม `uid: true` เข้าไป เพื่อบังคับให้เซิร์ฟเวอร์รู้ว่าเรากำลังใช้รหัส UID ดึงข้อมูล!
             for await (let msg of freshClient.fetch(latestUids, { envelope: true, uid: true })) {
                 emails.push({
                     uid: msg.uid,
@@ -157,7 +158,6 @@ app.get('/api/email-content', async (req, res) => {
         const client = await getImapClient(user, pass);
         let lock = await client.getMailboxLock(folder || 'INBOX');
         try {
-            // 🚨 อุดรอยรั่วเนื้อหาเมล: เพิ่ม `uid: uid` เช่นกันครับ
             let message = await client.fetchOne(uid, { source: true, uid: true });
             const parsed = await simpleParser(message.source);
             
@@ -177,5 +177,5 @@ app.get('/api/email-content', async (req, res) => {
 const PORT = process.env.PORT || 5001;
 app.listen(PORT, () => {
     console.log(`🦄 UniPony Backend ready on port ${PORT}`);
-    console.log(`🚀 Caching activated! Force Search (with UID fix) activated!`);
+    console.log(`🚀 Fresh Connection Mode Activated! UID Mapping Fixed!`);
 });
