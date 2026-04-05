@@ -6,7 +6,7 @@ const NodeCache = require("node-cache");
 
 const app = express();
 const myCache = new NodeCache({ stdTTL: 120 }); 
-const IMAP_HOST = 'mail.socialgrid.mom'; // 📌 โฮสต์ของเว็บที่ 1 (smtp.dev)
+const IMAP_HOST = 'imap.smtp.dev'; // 📌 โฮสต์ของเว็บที่ 1 (smtp.dev)
 
 app.use(cors({
     origin: [
